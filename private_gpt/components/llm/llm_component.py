@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 from collections.abc import Callable
 from typing import Any
@@ -8,6 +9,10 @@ from llama_index.core.settings import Settings as LlamaIndexSettings
 from llama_index.core.utils import set_global_tokenizer
 from transformers import AutoTokenizer  # type: ignore
 
+from private_gpt.components.llm.model_manager import (
+    available_models,
+    parse_model_id,
+)
 from private_gpt.components.llm.prompt_helper import get_prompt_style
 from private_gpt.paths import models_cache_path, models_path
 from private_gpt.settings.settings import Settings
@@ -21,6 +26,7 @@ class LLMComponent:
 
     @inject
     def __init__(self, settings: Settings) -> None:
+        self._settings = settings
         llm_mode = settings.llm.mode
         if settings.llm.tokenizer and settings.llm.mode != "mock":
             # Try to download the tokenizer. If it fails, the LLM will still work
@@ -223,3 +229,140 @@ class LLMComponent:
                 )
             case "mock":
                 self.llm = MockLLM()
+
+        # Record which model is currently active (for the UI dropdown).
+        self.current_model_id = self._initial_model_id(settings)
+        self.current_model_label = self._label_for(self.current_model_id)
+
+    # ------------------------------------------------------------------ #
+    # Runtime model switching (GGUF files + Ollama models)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _initial_model_id(settings: Settings) -> str:
+        mode = settings.llm.mode
+        if mode == "llamacpp":
+            return f"gguf:{settings.llamacpp.llm_hf_model_file}"
+        if mode == "ollama":
+            name = settings.ollama.llm_model
+            return f"ollama:{name}"
+        return f"other:{mode}"
+
+    @staticmethod
+    def _label_for(model_id: str) -> str:
+        if model_id.startswith("gguf:"):
+            return f"GGUF · {model_id[5:]}"
+        if model_id.startswith("ollama:"):
+            return f"Ollama · {model_id[7:]}"
+        return model_id.split(":", 1)[-1]
+
+    def list_models(self) -> list[dict[str, str]]:
+        """Models the UI can offer: GGUF files + any pulled Ollama models.
+
+        The currently-active model is always included, even if it is neither
+        a local GGUF file nor an Ollama model (e.g. a mock backend).
+
+        Ollama models are only offered when the ``llms-ollama`` integration is
+        actually installed; otherwise selecting one would fail at switch time.
+        """
+        base = getattr(getattr(self._settings, "ollama", None), "api_base", None)
+        ollama_installed = (
+            importlib.util.find_spec("llama_index.llms.ollama") is not None
+        )
+        models = available_models(
+            models_path, base, include_ollama=ollama_installed
+        )
+        ids = {m["id"] for m in models}
+        if self.current_model_id not in ids:
+            models.insert(
+                0,
+                {
+                    "id": self.current_model_id,
+                    "label": self.current_model_label,
+                    "source": "current",
+                },
+            )
+        return models
+
+    def _build_llamacpp(self, model_file: str) -> LLM:
+        from llama_index.llms.llama_cpp import LlamaCPP  # type: ignore
+
+        s = self._settings
+        prompt_style = get_prompt_style(s.llm.prompt_style)
+        settings_kwargs = {
+            "tfs_z": s.llamacpp.tfs_z,
+            "top_k": s.llamacpp.top_k,
+            "top_p": s.llamacpp.top_p,
+            "repeat_penalty": s.llamacpp.repeat_penalty,
+            "n_gpu_layers": -1,
+            "offload_kqv": True,
+        }
+        return LlamaCPP(
+            model_path=str(models_path / model_file),
+            temperature=s.llm.temperature,
+            max_new_tokens=s.llm.max_new_tokens,
+            context_window=s.llm.context_window,
+            generate_kwargs={},
+            callback_manager=LlamaIndexSettings.callback_manager,
+            model_kwargs=settings_kwargs,
+            messages_to_prompt=prompt_style.messages_to_prompt,
+            completion_to_prompt=prompt_style.completion_to_prompt,
+            verbose=True,
+        )
+
+    def _build_ollama(self, model_name: str) -> LLM:
+        try:
+            from llama_index.llms.ollama import Ollama  # type: ignore
+        except ImportError as e:
+            raise ValueError(
+                "Ollama support is not installed. Run: "
+                "poetry install --extras llms-ollama"
+            ) from e
+
+        s = self._settings
+        o = s.ollama
+        settings_kwargs = {
+            "tfs_z": o.tfs_z,
+            "num_predict": o.num_predict,
+            "top_k": o.top_k,
+            "top_p": o.top_p,
+            "repeat_last_n": o.repeat_last_n,
+            "repeat_penalty": o.repeat_penalty,
+        }
+        mn = model_name if ":" in model_name else model_name + ":latest"
+        llm = Ollama(
+            model=mn,
+            base_url=o.api_base,
+            temperature=s.llm.temperature,
+            context_window=s.llm.context_window,
+            additional_kwargs=settings_kwargs,
+            request_timeout=o.request_timeout,
+        )
+        if o.autopull_models:
+            from private_gpt.utils.ollama import check_connection, pull_model
+
+            if not check_connection(llm.client):
+                raise ValueError(
+                    f"Failed to connect to Ollama at {o.api_base}. "
+                    f"Is the Ollama server running?"
+                )
+            pull_model(llm.client, mn)
+        return llm
+
+    def switch_model(self, model_id: str) -> str:
+        """Rebuild the active LLM for the given model id. Returns its label.
+
+        Services read ``llm_component.llm`` at call time, so replacing it here
+        takes effect on the next message without restarting the app. Only the
+        LLM is switched; the embedding model stays fixed (changing it would
+        invalidate the existing vector index)."""
+        source, name = parse_model_id(model_id)
+        if source == "gguf":
+            if not (models_path / name).exists():
+                raise ValueError(f"GGUF model file not found in models/: {name}")
+            self.llm = self._build_llamacpp(name)
+        elif source == "ollama":
+            self.llm = self._build_ollama(name)
+        self.current_model_id = model_id
+        self.current_model_label = self._label_for(model_id)
+        logger.info("Switched active LLM to %s", model_id)
+        return self.current_model_label

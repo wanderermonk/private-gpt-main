@@ -51,14 +51,21 @@ llm:
   prompt_style: "llama3"
   # Should be matching the selected model
   max_new_tokens: 512
-  context_window: 3900
+  context_window: 8192   # Llama-3.1 supports 8k+; raised from 3900 so more retrieved context fits.
   # Select your tokenizer. Llama-index tokenizer is the default.
-  # tokenizer: meta-llama/Meta-Llama-3.1-8B-Instruct
+  # Left empty on purpose: meta-llama/Meta-Llama-3.1-8B-Instruct is a GATED
+  # HuggingFace repo and needs an access token. Empty = use llama-index's
+  # built-in tokenizer (slightly less precise token counting, but fully
+  # offline and no gated access). To use the exact tokenizer, set an HF_TOKEN
+  # with access and put the repo id here.
+  tokenizer: ""
   temperature: 0.1      # The temperature of the model. Increasing the temperature will make the model answer more creatively. A value of 0.1 would be more factual. (Default: 0.1)
 
 rag:
-  similarity_top_k: 2
+  similarity_top_k: 6
   #This value controls how many "top" documents the RAG returns to use in the context.
+  #Raised from 2 -> 6: with only 2 chunks the model often had too little context
+  #to answer, producing thin or empty answers. 6 gives it enough to work with.
   #similarity_value: 0.45
   #This value is disabled by default.  If you enable this settings, the RAG will only use articles that meet a certain percentage score.
   rerank:

@@ -6,8 +6,11 @@ llm:
   mode: llamacpp
   # Should be matching the selected model
   max_new_tokens: 512
-  context_window: 3900
-  tokenizer: meta-llama/Meta-Llama-3.1-8B-Instruct
+  context_window: 8192   # Llama-3.1 supports 8k+; raised from 3900 so more retrieved context fits.
+  # Empty on purpose: meta-llama/Meta-Llama-3.1-8B-Instruct is a GATED repo
+  # (needs an HF token). Empty = llama-index's built-in tokenizer, fully
+  # offline. To use the exact tokenizer, set HF_TOKEN and put the repo id here.
+  tokenizer: ""
   prompt_style: "llama3"
 
 llamacpp:
@@ -19,6 +22,9 @@ embedding:
 
 huggingface:
   embedding_hf_model_name: nomic-ai/nomic-embed-text-v1.5
+
+rag:
+  similarity_top_k: 6   # feed the model more retrieved chunks (was effectively 2)
 
 vectorstore:
   database: qdrant

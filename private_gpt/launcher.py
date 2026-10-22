@@ -15,13 +15,25 @@ from private_gpt.server.completions.completions_router import completions_router
 from private_gpt.server.embeddings.embeddings_router import embeddings_router
 from private_gpt.server.health.health_router import health_router
 from private_gpt.server.ingest.ingest_router import ingest_router
+from private_gpt.paths import local_data_path
+from private_gpt.server.recipes.agent_rag.agent_rag_router import agent_rag_router
+from private_gpt.server.recipes.geo.geo_router import geo_router
+from private_gpt.server.recipes.predict.predict_router import predict_router
 from private_gpt.server.recipes.summarize.summarize_router import summarize_router
 from private_gpt.settings.settings import Settings
+from private_gpt.utils.airgap import enforce_airgap, secure_data_dir
 
 logger = logging.getLogger(__name__)
 
 
 def create_app(root_injector: Injector) -> FastAPI:
+
+    # Strict air-gap / confidentiality enforcement. This runs before any
+    # service is used: it refuses to start on a cloud/remote configuration and
+    # locks the local data folder to owner-only. See private_gpt/utils/airgap.py.
+    _settings = root_injector.get(Settings)
+    enforce_airgap(_settings)
+    secure_data_dir(local_data_path)
 
     # Start the API
     async def bind_injector_to_request(request: Request) -> None:
@@ -34,6 +46,9 @@ def create_app(root_injector: Injector) -> FastAPI:
     app.include_router(chunks_router)
     app.include_router(ingest_router)
     app.include_router(summarize_router)
+    app.include_router(agent_rag_router)
+    app.include_router(predict_router)
+    app.include_router(geo_router)
     app.include_router(embeddings_router)
     app.include_router(health_router)
 

@@ -357,7 +357,9 @@ class AzureOpenAISettings(BaseModel):
 class UISettings(BaseModel):
     enabled: bool
     path: str
-    default_mode: Literal["RAG", "Search", "Basic", "Summarize"] = Field(
+    default_mode: Literal[
+        "RAG", "Agentic", "Predict", "Map", "Search", "Basic", "Summarize"
+    ] = Field(
         "RAG",
         description="The default mode.",
     )

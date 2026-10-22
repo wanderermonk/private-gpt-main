@@ -1,6 +1,5 @@
 """This file should be imported if and only if you want to run the UI locally."""
 
-import base64
 import logging
 import time
 from collections.abc import Iterable
@@ -22,9 +21,18 @@ from private_gpt.open_ai.extensions.context_filter import ContextFilter
 from private_gpt.server.chat.chat_service import ChatService, CompletionGen
 from private_gpt.server.chunks.chunks_service import Chunk, ChunksService
 from private_gpt.server.ingest.ingest_service import IngestService
+from private_gpt.server.recipes.agent_rag.agent_rag_service import (
+    AgentRagService,
+    AgentSearchResult,
+    AgentStep,
+)
+from private_gpt.server.recipes.geo.geo_service import GeoResult, GeoService
+from private_gpt.server.recipes.predict.predict_service import (
+    PredictResult,
+    PredictService,
+)
 from private_gpt.server.recipes.summarize.summarize_service import SummarizeService
 from private_gpt.settings.settings import settings
-from private_gpt.ui.images import logo_svg
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +47,9 @@ SOURCES_SEPARATOR = "<hr>Sources: \n"
 
 class Modes(str, Enum):
     RAG_MODE = "RAG"
+    AGENTIC_MODE = "Agentic"
+    PREDICT_MODE = "Predict"
+    MAP_MODE = "Map"
     SEARCH_MODE = "Search"
     BASIC_CHAT_MODE = "Basic"
     SUMMARIZE_MODE = "Summarize"
@@ -46,10 +57,101 @@ class Modes(str, Enum):
 
 MODES: list[Modes] = [
     Modes.RAG_MODE,
+    Modes.AGENTIC_MODE,
+    Modes.PREDICT_MODE,
+    Modes.MAP_MODE,
     Modes.SEARCH_MODE,
     Modes.BASIC_CHAT_MODE,
     Modes.SUMMARIZE_MODE,
 ]
+
+
+def _format_agent_step(step: "AgentStep") -> str:
+    """Render one agent step as a short markdown progress line."""
+    if step.kind == "plan":
+        qs = "; ".join(step.queries or [])
+        return f"🧭 **Planned searches:** {qs}"
+    if step.kind == "retrieve":
+        q = (step.queries or ["?"])[0]
+        n = step.num_new_chunks
+        suffix = f" (+{n} new)" if n is not None else ""
+        return f"🔎 Searched: _{q}_{suffix}"
+    if step.kind == "reflect":
+        return f"🤔 {step.detail}"
+    if step.kind == "answer":
+        return "✍️ Writing the answer…"
+    return f"• {step.detail}"
+
+
+def _format_predict_result(result: "PredictResult") -> str:
+    """Render a PredictResult as chat markdown: outlook + table + chart."""
+    parts: list[str] = [result.narrative.strip(), ""]
+
+    if result.history or result.forecast:
+        parts.append("\n**Data & projection**\n")
+        parts.append("| Period | Value | Type |")
+        parts.append("| --- | --- | --- |")
+        for p in result.history:
+            parts.append(f"| {p.period} | {p.value:g} | history |")
+        for p in result.forecast:
+            parts.append(f"| {p.period} | {p.value:g} | **forecast** |")
+        if result.method and result.method != "none":
+            err = (
+                f", backtest error {result.fit_error}"
+                if result.fit_error is not None
+                else ""
+            )
+            parts.append(f"\n_Method: {result.method}{err}._")
+
+    if result.chart_png_base64:
+        parts.append(
+            f"\n![forecast chart](data:image/png;base64,"
+            f"{result.chart_png_base64})"
+        )
+
+    if result.sources:
+        parts.append(SOURCES_SEPARATOR)
+        cur_sources = Source.curate_sources(result.sources)
+        used = set()
+        sources_text = "\n\n\n"
+        for index, source in enumerate(cur_sources, start=1):
+            key = f"{source.file}-{source.page}"
+            if key not in used:
+                sources_text += f"{index}. {source.file} (page {source.page}) \n\n"
+                used.add(key)
+        sources_text += "<hr>\n\n"
+        parts.append(sources_text)
+
+    return "\n".join(parts)
+
+
+def _format_geo_result(result: "GeoResult") -> str:
+    """Render a GeoResult as chat markdown: table + offline map + map file."""
+    if not result.places:
+        return (
+            "No places with coordinates were found in the selected documents. "
+            "Make sure the documents contain latitude/longitude values."
+        )
+    parts: list[str] = [f"**Found {len(result.places)} located place(s).**", ""]
+    parts.append("| # | Place | Lat | Lon | Event |")
+    parts.append("| --- | --- | --- | --- | --- |")
+    for i, p in enumerate(result.places, start=1):
+        event = (p.event or "").replace("|", "/")
+        parts.append(f"| {i} | {p.name} | {p.lat:.4f} | {p.lon:.4f} | {event} |")
+
+    if result.static_png_base64:
+        parts.append(
+            f"\n![map](data:image/png;base64,{result.static_png_base64})"
+        )
+
+    if result.interactive_html_path:
+        parts.append(
+            f"\n🗺️ **Interactive map saved to:** `{result.interactive_html_path}`\n"
+            "\nOpen that file in a browser for a pan/zoom map with event "
+            "popups. _(The interactive map loads basemap tiles from the "
+            "internet; the offline image above makes no network calls.)_"
+        )
+    return "\n".join(parts)
 
 
 class Source(BaseModel):
@@ -88,11 +190,17 @@ class PrivateGptUi:
         chat_service: ChatService,
         chunks_service: ChunksService,
         summarizeService: SummarizeService,
+        agent_rag_service: AgentRagService,
+        predict_service: PredictService,
+        geo_service: GeoService,
     ) -> None:
         self._ingest_service = ingest_service
         self._chat_service = chat_service
         self._chunks_service = chunks_service
         self._summarize_service = summarizeService
+        self._agent_rag_service = agent_rag_service
+        self._predict_service = predict_service
+        self._geo_service = geo_service
 
         # Cache the UI blocks
         self._ui_block = None
@@ -106,8 +214,37 @@ class PrivateGptUi:
         )
         self._system_prompt = self._get_default_system_prompt(self._default_mode)
 
-    def _chat(
-        self, message: str, history: list[list[str]], mode: Modes, *_: Any
+        # Model selection (GGUF files in models/ + any pulled Ollama models).
+        # Reached via the chat service's LLM component so we can switch at
+        # runtime without restarting the app.
+        self._llm_component = self._chat_service.llm_component
+        self._model_id_by_label: dict[str, str] = {}
+        self._refresh_model_choices()
+
+    # ------------------------- model selection ---------------------------- #
+    def _refresh_model_choices(self) -> list[str]:
+        models = self._llm_component.list_models()
+        self._model_id_by_label = {m["label"]: m["id"] for m in models}
+        return list(self._model_id_by_label.keys())
+
+    def _set_model(self, label: str) -> Any:
+        model_id = self._model_id_by_label.get(label)
+        if not model_id:
+            return gr.update()
+        try:
+            new_label = self._llm_component.switch_model(model_id)
+            gr.Info(f"Model switched to {new_label}")
+        except Exception as e:  # keep the UI alive on a bad switch
+            logger.error("Model switch failed: %s", e)
+            gr.Warning(f"Could not switch model: {e}")
+        return gr.update()
+
+    def _run_single(
+        self,
+        message: str,
+        history: list[list[str]],
+        mode: Modes,
+        files_selected: list[str] | None,
     ) -> Any:
         def yield_deltas(completion_gen: CompletionGen) -> Iterable[str]:
             full_response: str = ""
@@ -174,17 +311,8 @@ class PrivateGptUi:
             )
         match mode:
             case Modes.RAG_MODE:
-                # Use only the selected file for the query
-                context_filter = None
-                if self._selected_filename is not None:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
+                # Restrict to the selected files (empty selection = all files)
+                context_filter = self._context_filter(files_selected)
 
                 query_stream = self._chat_service.stream_chat(
                     messages=all_messages,
@@ -192,6 +320,105 @@ class PrivateGptUi:
                     context_filter=context_filter,
                 )
                 yield from yield_deltas(query_stream)
+            case Modes.AGENTIC_MODE:
+                # Agentic RAG: the model plans searches, retrieves, reflects,
+                # and may search again before answering with citations.
+                # Restrict to the selected files (empty selection = all files)
+                context_filter = self._context_filter(files_selected)
+
+                progress = "🤖 **Agent working…**\n\n"
+                final_result: AgentSearchResult | None = None
+                for item in self._agent_rag_service.search_stream(
+                    query=message, context_filter=context_filter
+                ):
+                    if isinstance(item, AgentSearchResult):
+                        final_result = item
+                        break
+                    # item is an AgentStep -> show live progress
+                    progress += _format_agent_step(item) + "\n\n"
+                    yield progress
+
+                # Build the final message: answer + sources + collapsed trace.
+                if final_result is None:
+                    yield "The agent did not return a result."
+                else:
+                    full_response = final_result.response
+                    if final_result.sources:
+                        full_response += SOURCES_SEPARATOR
+                        cur_sources = Source.curate_sources(final_result.sources)
+                        used_files = set()
+                        sources_text = "\n\n\n"
+                        for index, source in enumerate(cur_sources, start=1):
+                            if f"{source.file}-{source.page}" not in used_files:
+                                sources_text += (
+                                    f"{index}. {source.file} "
+                                    f"(page {source.page}) \n\n"
+                                )
+                                used_files.add(f"{source.file}-{source.page}")
+                        sources_text += "<hr>\n\n"
+                        full_response += sources_text
+                    trace = "\n".join(
+                        _format_agent_step(s) for s in final_result.steps
+                    )
+                    full_response += (
+                        f"\n\n<details><summary>🧠 Agent steps</summary>\n\n"
+                        f"{trace}\n\n</details>"
+                    )
+                    yield full_response
+            case Modes.PREDICT_MODE:
+                # Predictive analysis: extract a numeric series from the docs,
+                # forecast it locally, and narrate a cited outlook + chart.
+                context_filter = self._context_filter(files_selected)
+
+                progress = "📈 **Predictive analysis…**\n\n"
+                predict_result: PredictResult | None = None
+                for item in self._predict_service.predict_stream(
+                    metric=message, context_filter=context_filter
+                ):
+                    if isinstance(item, PredictResult):
+                        predict_result = item
+                        break
+                    progress += _format_agent_step(item) + "\n\n"
+                    yield progress
+
+                if predict_result is None:
+                    yield "The prediction did not return a result."
+                else:
+                    final = _format_predict_result(predict_result)
+                    trace = "\n".join(
+                        _format_agent_step(s) for s in predict_result.steps
+                    )
+                    final += (
+                        f"\n\n<details><summary>🧠 Analysis steps</summary>\n\n"
+                        f"{trace}\n\n</details>"
+                    )
+                    yield final
+            case Modes.MAP_MODE:
+                # Extract located places (+events) and plot them on a map.
+                context_filter = self._context_filter(files_selected)
+                progress = "🗺️ **Mapping places…**\n\n"
+                geo_result: GeoResult | None = None
+                for item in self._geo_service.map_stream(
+                    query=message, context_filter=context_filter
+                ):
+                    if isinstance(item, GeoResult):
+                        geo_result = item
+                        break
+                    progress += _format_agent_step(item) + "\n\n"
+                    yield progress
+
+                if geo_result is None:
+                    yield "The map step did not return a result."
+                else:
+                    out = _format_geo_result(geo_result)
+                    trace = "\n".join(
+                        _format_agent_step(s) for s in geo_result.steps
+                    )
+                    out += (
+                        f"\n\n<details><summary>🧠 Steps</summary>\n\n"
+                        f"{trace}\n\n</details>"
+                    )
+                    yield out
             case Modes.BASIC_CHAT_MODE:
                 llm_stream = self._chat_service.stream_chat(
                     messages=all_messages,
@@ -201,7 +428,10 @@ class PrivateGptUi:
 
             case Modes.SEARCH_MODE:
                 response = self._chunks_service.retrieve_relevant(
-                    text=message, limit=4, prev_next_chunks=0
+                    text=message,
+                    context_filter=self._context_filter(files_selected),
+                    limit=4,
+                    prev_next_chunks=0,
                 )
 
                 sources = Source.curate_sources(response)
@@ -213,17 +443,8 @@ class PrivateGptUi:
                     for index, source in enumerate(sources, start=1)
                 )
             case Modes.SUMMARIZE_MODE:
-                # Summarize the given message, optionally using selected files
-                context_filter = None
-                if self._selected_filename:
-                    docs_ids = []
-                    for ingested_document in self._ingest_service.list_ingested():
-                        if (
-                            ingested_document.doc_metadata["file_name"]
-                            == self._selected_filename
-                        ):
-                            docs_ids.append(ingested_document.doc_id)
-                    context_filter = ContextFilter(docs_ids=docs_ids)
+                # Summarize the selected files (empty selection = all files)
+                context_filter = self._context_filter(files_selected)
 
                 summary_stream = self._summarize_service.stream_summarize(
                     use_context=True,
@@ -231,6 +452,100 @@ class PrivateGptUi:
                     instructions=message,
                 )
                 yield from yield_tokens(summary_stream)
+
+    # ---------------------- multi-file / multi-model ---------------------- #
+    def _ingested_file_names(self) -> list[str]:
+        names = set()
+        for doc in self._ingest_service.list_ingested():
+            md = doc.doc_metadata
+            if md:
+                names.add(md.get("file_name", "[FILE NAME MISSING]"))
+        return sorted(names)
+
+    def _context_filter(self, files_selected: list[str] | None):
+        """Build a ContextFilter for the chosen files. Empty = all files."""
+        if not files_selected:
+            return None
+        wanted = set(files_selected)
+        docs_ids = []
+        for doc in self._ingest_service.list_ingested():
+            md = doc.doc_metadata or {}
+            if md.get("file_name") in wanted:
+                docs_ids.append(doc.doc_id)
+        return ContextFilter(docs_ids=docs_ids) if docs_ids else None
+
+    def _ensure_model(self, model_id: str) -> None:
+        if getattr(self._llm_component, "current_model_id", None) != model_id:
+            self._llm_component.switch_model(model_id)
+
+    # Upload / delete handlers that refresh the multi-select file checkbox.
+    def _upload_and_refresh(self, files: list[str]) -> Any:
+        self._upload_file(files)
+        return gr.update(choices=self._ingested_file_names(), value=[])
+
+    def _delete_checked_files(self, checked: list[str] | None) -> Any:
+        wanted = set(checked or [])
+        for doc in list(self._ingest_service.list_ingested()):
+            md = doc.doc_metadata or {}
+            if md.get("file_name") in wanted:
+                self._ingest_service.delete(doc.doc_id)
+        return gr.update(choices=self._ingested_file_names(), value=[])
+
+    def _delete_all_and_refresh(self) -> Any:
+        for doc in list(self._ingest_service.list_ingested()):
+            self._ingest_service.delete(doc.doc_id)
+        return gr.update(choices=self._ingested_file_names(), value=[])
+
+    def _chat(
+        self,
+        message: str,
+        history: list[list[str]],
+        mode: Modes,
+        models_selected: list[str] | None,
+        files_selected: list[str] | None,
+        *_: Any,
+    ) -> Any:
+        """Entry point from the chat box.
+
+        One model selected -> normal (streamed) answer. Several selected ->
+        run the same query on each and stack the answers for comparison."""
+        labels = models_selected or []
+        model_ids: list[str] = []
+        for lbl in labels:
+            mid = self._model_id_by_label.get(lbl)
+            if mid and mid not in model_ids:
+                model_ids.append(mid)
+
+        # Single (or no) model -> stream normally.
+        if len(model_ids) <= 1:
+            if model_ids:
+                try:
+                    self._ensure_model(model_ids[0])
+                except Exception as e:
+                    yield f"⚠️ Could not load model: {e}"
+                    return
+            yield from self._run_single(message, history, mode, files_selected)
+            return
+
+        # Multiple models -> run each and compare (no per-token streaming).
+        combined = (
+            f"**Comparing {len(model_ids)} models** on the same question.\n"
+        )
+        for mid in model_ids:
+            label = self._llm_component._label_for(mid)
+            header = f"\n\n## 🧠 {label}\n\n"
+            try:
+                self._ensure_model(mid)
+            except Exception as e:
+                combined += header + f"_could not load this model: {e}_\n"
+                yield combined
+                continue
+            yield combined + header + "_running…_"
+            last = ""
+            for chunk in self._run_single(message, history, mode, files_selected):
+                last = chunk
+            combined += header + (last or "_(no output)_") + "\n\n<hr>\n"
+            yield combined
 
     # On initialization and on mode change, this function set the system prompt
     # to the default prompt based on the mode (and user settings).
@@ -257,6 +572,23 @@ class PrivateGptUi:
         match mode:
             case Modes.RAG_MODE:
                 return "Get contextualized answers from selected files."
+            case Modes.AGENTIC_MODE:
+                return (
+                    "Agent plans multiple searches, reflects on what it finds, "
+                    "and searches again before answering with citations."
+                )
+            case Modes.PREDICT_MODE:
+                return (
+                    "Forecast a metric from your documents: type the metric "
+                    "(e.g. 'quarterly revenue'). Extracts the numbers, projects "
+                    "ahead, and writes a cited outlook with a chart."
+                )
+            case Modes.MAP_MODE:
+                return (
+                    "Plot places from your documents on a map. Type a topic "
+                    "(e.g. 'incidents') or leave blank for all located places. "
+                    "Returns a map + table + an interactive map file."
+                )
             case Modes.SEARCH_MODE:
                 return "Find relevant chunks of text in selected files."
             case Modes.BASIC_CHAT_MODE:
@@ -367,185 +699,169 @@ class PrivateGptUi:
         logger.debug("Creating the UI blocks")
         with gr.Blocks(
             title=UI_TAB_TITLE,
-            theme=gr.themes.Soft(primary_hue=slate),
-            css=".logo { "
-            "display:flex;"
-            "background-color: #C7BAFF;"
-            "height: 80px;"
-            "border-radius: 8px;"
-            "align-content: center;"
-            "justify-content: center;"
-            "align-items: center;"
-            "}"
-            ".logo img { height: 25% }"
-            ".contain { display: flex !important; flex-direction: column !important; }"
-            "#component-0, #component-3, #component-10, #component-8  { height: 100% !important; }"
-            "#chatbot { flex-grow: 1 !important; overflow: auto !important;}"
-            "#col { height: calc(100vh - 112px - 16px) !important; }"
-            "hr { margin-top: 1em; margin-bottom: 1em; border: 0; border-top: 1px solid #FFF; }"
-            ".avatar-image { background-color: antiquewhite; border-radius: 2px; }"
-            ".footer { text-align: center; margin-top: 20px; font-size: 14px; display: flex; align-items: center; justify-content: center; }"
-            ".footer-zylon-link { display:flex; margin-left: 5px; text-decoration: auto; color: var(--body-text-color); }"
-            ".footer-zylon-link:hover { color: #C7BAFF; }"
-            ".footer-zylon-ico { height: 20px; margin-left: 5px; background-color: antiquewhite; border-radius: 2px; }",
+            theme=gr.themes.Soft(
+                primary_hue=slate,
+                neutral_hue="slate",
+                # System fonts only — no web-font fetch, so it stays offline.
+                font=[
+                    "system-ui",
+                    "-apple-system",
+                    "Segoe UI",
+                    "Roboto",
+                    "Helvetica",
+                    "sans-serif",
+                ],
+                font_mono=["ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
+            ),
+            css=(
+                # Fill the whole window; no outer page scroll.
+                ".gradio-container { max-width:100% !important;"
+                "  height:100vh !important; padding:10px 16px 4px !important;"
+                "  overflow:hidden !important; }"
+                "footer { display:none !important; }"  # hide default gradio footer
+                # Header
+                ".app-header { background:linear-gradient(90deg,#5b4bdc,#8E7BFF);"
+                "  color:#fff; padding:14px 20px; border-radius:14px;"
+                "  box-shadow:0 4px 16px rgba(91,75,220,.28); }"
+                ".app-header h1 { margin:0; font-size:20px; font-weight:750; }"
+                ".app-header p { margin:3px 0 0; font-size:12.5px; opacity:.92; }"
+                # Main area fills remaining height; columns manage their own scroll
+                "#main-row { gap:14px; align-items:stretch;"
+                "  height:calc(100vh - 118px); }"
+                "#left-col { height:calc(100vh - 118px); overflow-y:auto;"
+                "  padding-right:6px; }"
+                "#chat-col { height:100%; display:flex; flex-direction:column; }"
+                "#chatbot { flex:1 1 auto !important; min-height:0 !important;"
+                "  height:auto !important; border-radius:14px; }"
+                # Card-like groups
+                ".gr-group, .block.gr-group { border-radius:14px !important; }"
+                ".prose h3 { margin:.1em 0 .45em; font-size:14px; }"
+                "hr { margin:1em 0; border:0;"
+                "  border-top:1px solid var(--border-color-primary); }"
+                ".app-footer { text-align:center; padding:6px 0 2px;"
+                "  font-size:12px; color:var(--body-text-color-subdued); }"
+                # Phone / small windows: let it stack and scroll
+                "@media (max-width:820px){"
+                "  .gradio-container{ height:auto !important; overflow:auto !important; }"
+                "  #main-row{ height:auto; flex-direction:column; }"
+                "  #chatbot{ height:60vh !important; } }"
+            ),
         ) as blocks:
+            # --- Header (your branding) ---------------------------------- #
             with gr.Row():
-                gr.HTML(f"<div class='logo'/><img src={logo_svg} alt=PrivateGPT></div")
+                gr.HTML(
+                    "<div class='app-header'>"
+                    "<h1>Private GPT · Fighter</h1>"
+                    "<p>100% local &amp; private — your documents never leave "
+                    "this machine. Ask, reason over, and forecast from your "
+                    "files.</p>"
+                    "</div>"
+                )
 
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=3):
-                    default_mode = self._default_mode
-                    mode = gr.Radio(
-                        [mode.value for mode in MODES],
-                        label="Mode",
-                        value=default_mode,
-                    )
-                    explanation_mode = gr.Textbox(
-                        placeholder=self._get_default_mode_explanation(default_mode),
-                        show_label=False,
-                        max_lines=3,
-                        interactive=False,
-                    )
-                    upload_button = gr.components.UploadButton(
-                        "Upload File(s)",
-                        type="filepath",
-                        file_count="multiple",
-                        size="sm",
-                    )
-                    ingested_dataset = gr.List(
-                        self._list_ingested_files,
-                        headers=["File name"],
-                        label="Ingested Files",
-                        height=235,
-                        interactive=False,
-                        render=False,  # Rendered under the button
-                    )
-                    upload_button.upload(
-                        self._upload_file,
-                        inputs=upload_button,
-                        outputs=ingested_dataset,
-                    )
-                    ingested_dataset.change(
-                        self._list_ingested_files,
-                        outputs=ingested_dataset,
-                    )
-                    ingested_dataset.render()
-                    deselect_file_button = gr.components.Button(
-                        "De-select selected file", size="sm", interactive=False
-                    )
-                    selected_text = gr.components.Textbox(
-                        "All files", label="Selected for Query or Deletion", max_lines=1
-                    )
-                    delete_file_button = gr.components.Button(
-                        "🗑️ Delete selected file",
-                        size="sm",
-                        visible=settings().ui.delete_file_button_enabled,
-                        interactive=False,
-                    )
-                    delete_files_button = gr.components.Button(
-                        "⚠️ Delete ALL files",
-                        size="sm",
-                        visible=settings().ui.delete_all_files_button_enabled,
-                    )
-                    deselect_file_button.click(
-                        self._deselect_selected_file,
-                        outputs=[
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
-                    )
-                    ingested_dataset.select(
-                        fn=self._selected_a_file,
-                        outputs=[
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
-                    )
-                    delete_file_button.click(
-                        self._delete_selected_file,
-                        outputs=[
-                            ingested_dataset,
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
-                    )
-                    delete_files_button.click(
-                        self._delete_all_files,
-                        outputs=[
-                            ingested_dataset,
-                            delete_file_button,
-                            deselect_file_button,
-                            selected_text,
-                        ],
-                    )
+            with gr.Row(equal_height=False, elem_id="main-row"):
+                # ===================== LEFT: controls ===================== #
+                with gr.Column(scale=3, elem_id="left-col"):
+                    # ---- Documents (upload + multi-select) ------------ #
+                    with gr.Group():
+                        gr.Markdown("### 📄 Documents")
+                        upload_button = gr.components.UploadButton(
+                            "📤 Upload file(s) — click or drag & drop",
+                            type="filepath",
+                            file_count="multiple",
+                            size="sm",
+                        )
+                        files_checkbox = gr.CheckboxGroup(
+                            choices=self._ingested_file_names(),
+                            value=[],
+                            label="Query these files (tick none = use ALL)",
+                        )
+                        with gr.Row():
+                            refresh_files_btn = gr.Button("↻ Refresh", size="sm")
+                            delete_checked_btn = gr.Button(
+                                "🗑️ Delete ticked",
+                                size="sm",
+                                visible=settings().ui.delete_file_button_enabled,
+                            )
+                            delete_all_btn = gr.Button(
+                                "⚠️ Delete ALL",
+                                size="sm",
+                                visible=settings().ui.delete_all_files_button_enabled,
+                            )
+
+                    # ---- Model picker (multi-select) ------------------ #
+                    with gr.Group():
+                        gr.Markdown("### 🧠 Model(s)")
+                        model_multiselect = gr.Dropdown(
+                            choices=self._refresh_model_choices(),
+                            value=[self._llm_component.current_model_label],
+                            label="Pick 1+ models (several = compare answers)",
+                            multiselect=True,
+                            interactive=True,
+                        )
+                        refresh_models_btn = gr.Button(
+                            "↻ Refresh model list", size="sm"
+                        )
+
+                    # ---- Mode selector -------------------------------- #
+                    with gr.Group():
+                        gr.Markdown("### 🎛️ Mode")
+                        default_mode = self._default_mode
+                        mode = gr.Radio(
+                            [mode.value for mode in MODES],
+                            show_label=False,
+                            value=default_mode,
+                        )
+                        explanation_mode = gr.Textbox(
+                            value=self._get_default_mode_explanation(default_mode),
+                            show_label=False,
+                            max_lines=3,
+                            interactive=False,
+                        )
+
                     system_prompt_input = gr.Textbox(
                         placeholder=self._system_prompt,
-                        label="System Prompt",
+                        label="System prompt",
                         lines=2,
                         interactive=True,
                         render=False,
                     )
-                    # When mode changes, set default system prompt, and other stuffs
+
+                    # ---- wiring --------------------------------------- #
+                    refresh_models_btn.click(
+                        lambda: gr.update(choices=self._refresh_model_choices()),
+                        outputs=model_multiselect,
+                    )
+                    upload_button.upload(
+                        self._upload_and_refresh,
+                        inputs=upload_button,
+                        outputs=files_checkbox,
+                    )
+                    refresh_files_btn.click(
+                        lambda: gr.update(choices=self._ingested_file_names()),
+                        outputs=files_checkbox,
+                    )
+                    delete_checked_btn.click(
+                        self._delete_checked_files,
+                        inputs=files_checkbox,
+                        outputs=files_checkbox,
+                    )
+                    delete_all_btn.click(
+                        self._delete_all_and_refresh,
+                        outputs=files_checkbox,
+                    )
                     mode.change(
                         self._set_current_mode,
                         inputs=mode,
                         outputs=[system_prompt_input, explanation_mode],
                     )
-                    # On blur, set system prompt to use in queries
                     system_prompt_input.blur(
                         self._set_system_prompt,
                         inputs=system_prompt_input,
                     )
 
-                    def get_model_label() -> str | None:
-                        """Get model label from llm mode setting YAML.
-
-                        Raises:
-                            ValueError: If an invalid 'llm_mode' is encountered.
-
-                        Returns:
-                            str: The corresponding model label.
-                        """
-                        # Get model label from llm mode setting YAML
-                        # Labels: local, openai, openailike, sagemaker, mock, ollama
-                        config_settings = settings()
-                        if config_settings is None:
-                            raise ValueError("Settings are not configured.")
-
-                        # Get llm_mode from settings
-                        llm_mode = config_settings.llm.mode
-
-                        # Mapping of 'llm_mode' to corresponding model labels
-                        model_mapping = {
-                            "llamacpp": config_settings.llamacpp.llm_hf_model_file,
-                            "openai": config_settings.openai.model,
-                            "openailike": config_settings.openai.model,
-                            "azopenai": config_settings.azopenai.llm_model,
-                            "sagemaker": config_settings.sagemaker.llm_endpoint_name,
-                            "mock": llm_mode,
-                            "ollama": config_settings.ollama.llm_model,
-                            "gemini": config_settings.gemini.model,
-                        }
-
-                        if llm_mode not in model_mapping:
-                            print(f"Invalid 'llm mode': {llm_mode}")
-                            return None
-
-                        return model_mapping[llm_mode]
-
-                with gr.Column(scale=7, elem_id="col"):
-                    # Determine the model label based on the value of PGPT_PROFILES
-                    model_label = get_model_label()
-                    if model_label is not None:
-                        label_text = (
-                            f"LLM: {settings().llm.mode} | Model: {model_label}"
-                        )
-                    else:
-                        label_text = f"LLM: {settings().llm.mode}"
-
+                # ===================== RIGHT: chat ======================== #
+                with gr.Column(scale=7, elem_id="chat-col"):
+                    label_text = f"Model: {self._llm_component.current_model_label}"
                     _ = gr.ChatInterface(
                         self._chat,
                         chatbot=gr.Chatbot(
@@ -553,19 +869,20 @@ class PrivateGptUi:
                             show_copy_button=True,
                             elem_id="chatbot",
                             render=False,
-                            avatar_images=(
-                                None,
-                                AVATAR_BOT,
-                            ),
+                            avatar_images=(None, AVATAR_BOT),
                         ),
-                        additional_inputs=[mode, upload_button, system_prompt_input],
+                        additional_inputs=[
+                            mode,
+                            model_multiselect,
+                            files_checkbox,
+                            system_prompt_input,
+                        ],
                     )
 
             with gr.Row():
-                avatar_byte = AVATAR_BOT.read_bytes()
-                f_base64 = f"data:image/png;base64,{base64.b64encode(avatar_byte).decode('utf-8')}"
                 gr.HTML(
-                    f"<div class='footer'><a class='footer-zylon-link' href='https://zylon.ai/'>Maintained by Zylon <img class='footer-zylon-ico' src='{f_base64}' alt=Zylon></a></div>"
+                    "<div class='app-footer'>© 2026 Fighter · Runs fully offline"
+                    " · Built on PrivateGPT (Apache-2.0)</div>"
                 )
 
         return blocks
